@@ -10,6 +10,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/semaphore"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -33,6 +34,30 @@ const (
 	clusterRetryTimeout        = 10 * time.Second
 	watchResourcesRetryTimeout = 1 * time.Second
 )
+
+var (
+	listSemaphore = semaphore.NewWeighted(10)
+)
+
+// SetMaxConcurrentList set maximum number of concurrent K8S list calls.
+// Note: method is not thread safe. Use it during initialization before executing ClusterCache.EnsureSynced method.
+func SetMaxConcurrentList(val int64) {
+	if val > 0 {
+		listSemaphore = semaphore.NewWeighted(val)
+	} else {
+		listSemaphore = nil
+	}
+}
+
+func list(resClient dynamic.ResourceInterface, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	if listSemaphore != nil {
+		if err := listSemaphore.Acquire(context.Background(), 1); err != nil {
+			return nil, err
+		}
+		defer listSemaphore.Release(1)
+	}
+	return resClient.List(opts)
+}
 
 type apiMeta struct {
 	namespaced      bool
@@ -278,7 +303,7 @@ func (c *clusterInfo) watchEvents(ctx context.Context, api kube.APIResourceInfo,
 		err = runSynced(c.lock, func() error {
 			if info.resourceVersion == "" {
 				listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
-					res, err := resClient.List(opts)
+					res, err := list(resClient, opts)
 					if err == nil {
 						info.resourceVersion = res.GetResourceVersion()
 					}
@@ -416,10 +441,17 @@ func (c *clusterInfo) sync() (err error) {
 		lock.Unlock()
 
 		return c.processApi(client, api, func(resClient dynamic.ResourceInterface, ns string) error {
+			gkLog := c.log.WithField("group/kind", api.GroupKind).WithField("namespace", util.FirstNonEmpty(ns, "all namespaces"))
+			gkLog.Debug("start loading initial state")
+			total := 0
 
 			listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
-				res, err := resClient.List(opts)
+				res, err := list(resClient, opts)
 				if err == nil {
+					if len(res.Items) > 0 {
+						gkLog.Debugf("loaded %d objects", len(res.Items))
+						total += len(res.Items)
+					}
 					lock.Lock()
 					info.resourceVersion = res.GetResourceVersion()
 					lock.Unlock()
@@ -442,6 +474,7 @@ func (c *clusterInfo) sync() (err error) {
 				return fmt.Errorf("failed to load initial state of resource %s: %v", api.GroupKind.String(), err)
 			}
 
+			gkLog.Debugf("done loading initial state (%d objects).", total)
 			go c.watchEvents(ctx, api, info, resClient, ns)
 			return nil
 		})

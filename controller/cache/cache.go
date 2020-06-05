@@ -2,8 +2,11 @@ package cache
 
 import (
 	"context"
+	"math"
 	"reflect"
 	"sync"
+
+	"github.com/argoproj/argo-cd/util/env"
 
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
@@ -20,6 +23,10 @@ import (
 	"github.com/argoproj/argo-cd/util/kube"
 	"github.com/argoproj/argo-cd/util/settings"
 )
+
+func init() {
+	SetMaxConcurrentList(int64(env.ParseNumFromEnv("ARGOCD_MAX_CONCURRENT_K8S_LIST_COUNT", 10, 0, math.MaxInt64)))
+}
 
 type cacheSettings struct {
 	ResourceOverrides   map[string]appv1.ResourceOverride
